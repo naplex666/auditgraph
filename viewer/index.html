@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AuditGraph — viewer</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2em auto; padding: 0 1em; color: #222; }
+  h1 { font-size: 1.4em; } h2 { font-size: 1.1em; margin-top: 1.5em; }
+  label { display: block; margin: .5em 0; font-size: .9em; }
+  input[type=text], input[type=password] { width: 100%; box-sizing: border-box; padding: .4em; }
+  .row { display: flex; gap: .5em; flex-wrap: wrap; align-items: end; }
+  .row label { flex: 1; min-width: 140px; }
+  button { padding: .5em 1em; cursor: pointer; }
+  button.q { margin: .2em .2em .2em 0; }
+  button.q.active { font-weight: bold; }
+  table { border-collapse: collapse; margin-top: 1em; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: .35em .6em; text-align: left; font-size: .9em; }
+  th { background: #f0f0f0; }
+  #status { margin-top: 1em; font-size: .9em; }
+  #status.error { color: #a00; }
+  svg { margin-top: 1em; max-width: 100%; }
+  .node { fill: #e8f0fe; stroke: #3367d6; }
+  .sink { fill: #fce8e6; stroke: #a50e0e; }
+  .edge { stroke: #555; stroke-width: 1.5; marker-end: url(#arrow); }
+  .nlabel { font: 13px system-ui, sans-serif; }
+  code { background: #f0f0f0; padding: 0 .25em; }
+  .hint { font-size: .85em; color: #555; }
+</style>
+</head>
+<body>
+<h1>AuditGraph — graph viewer</h1>
+<p class="hint">Static page, no build step. Talks to your local
+<code>relate serve</code> HTTP Query API v2 on <code>127.0.0.1:7474</code>.
+Your token is pasted here, kept only in this page, and sent only to
+localhost — it is never stored in the file.</p>
+
+<h2>1. Connect</h2>
+<div class="row">
+  <label>Server URL
+    <input type="text" id="url" value="http://127.0.0.1:7474">
+  </label>
+  <label>Token (from <code>data/audit.rl.auth-token</code> — the hex part
+    after <code>relate:</code>, or paste the whole <code>relate:…</code>)
+    <input type="password" id="token" placeholder="e.g. 86355506…">
+  </label>
+</div>
+
+<h2>2. Run a showcase query</h2>
+<div class="row">
+  <label>Function name (Q1, Q3)
+    <input type="text" id="fn" value="withdraw">
+  </label>
+  <label>Sink kind (Q2)
+    <input type="text" id="kind" value="call.value">
+  </label>
+  <label>Privileged function (Q3)
+    <input type="text" id="priv" value="withdraw">
+  </label>
+</div>
+<p>
+  <button class="q" data-q="blast-radius">Q1 · Blast radius</button>
+  <button class="q" data-q="paths-to-sink">Q2 · Paths to sink</button>
+  <button class="q" data-q="reach-privileged">Q3 · Who can reach</button>
+  <button class="q" data-q="findings-by-severity">Q4 · Findings by severity</button>
+</p>
+
+<div id="status"></div>
+<div id="graph"></div>
+<div id="table"></div>
+
+<script>
+const QUERIES = {
+  "blast-radius": {
+    cypher: "MATCH (f:Function {name: $fn})-[:CALLS|READS|WRITES*1..4]-(x) RETURN DISTINCT x.contract AS contract, x.name AS name, labels(x) AS labels",
+    params: () => ({ fn: document.getElementById("fn").value }),
+    draw: (rows) => chips(rows.map(r => r.name + " (" + r.contract + ")"))
+  },
+  "paths-to-sink": {
+    cypher: "MATCH p=(entry:Function)-[:CALLS*1..5]->(f:Function)-[:HAS_SINK]->(s:Sink {kind: $kind}) RETURN DISTINCT entry.contract AS contract, entry.name AS entry, f.name AS fn, s.kind AS kind",
+    params: () => ({ kind: document.getElementById("kind").value }),
+    draw: (rows) => chains(rows.map(r => [r.entry, r.fn, r.kind]), "sink")
+  },
+  "reach-privileged": {
+    cypher: "MATCH p=(f:Function)-[:CALLS*1..6]->(priv:Function {name: $priv}) RETURN DISTINCT f.contract AS contract, f.name AS caller, priv.name AS priv",
+    params: () => ({ priv: document.getElementById("priv").value }),
+    draw: (rows) => chains(rows.map(r => [r.caller, r.priv]), "")
+  },
+  "findings-by-severity": {
+    cypher: "MATCH (fd:Finding)-[:HAS_CWE]->(c:CWE) RETURN fd.severity AS severity, c.id AS cwe, count(*) AS findings",
+    params: () => ({}),
+    draw: () => ""
+  }
+};
+
+function tokenPassword() {
+  const t = document.getElementById("token").value.trim();
+  return t.includes(":") ? t.split(":").slice(1).join(":") : t;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+
+function chips(items) {
+  if (!items.length) return "";
+  return "<p>" + items.map(i => "<code>" + esc(i) + "</code>").join(" ") + "</p>";
+}
+
+function chains(paths, lastClass) {
+  if (!paths.length) return "";
+  const W = 880, BH = 34, GAP = 16;
+  let y = 10, out = "";
+  for (const path of paths) {
+    const n = path.length, bw = Math.min(220, (W - (n - 1) * 40) / n);
+    let x = 10;
+    path.forEach((label, i) => {
+      const cls = (i === n - 1 && lastClass) ? lastClass : "node";
+      out += `<rect class="${cls}" x="${x}" y="${y}" width="${bw}" height="${BH}" rx="6"/>` +
+        `<text class="nlabel" x="${x + bw / 2}" y="${y + 22}" text-anchor="middle">${esc(label)}</text>`;
+      if (i < n - 1) {
+        out += `<line class="edge" x1="${x + bw}" y1="${y + BH / 2}" x2="${x + bw + 40}" y2="${y + BH / 2}"/>`;
+      }
+      x += bw + 40;
+    });
+    y += BH + GAP;
+  }
+  return `<svg width="${W}" height="${y}" viewBox="0 0 ${W} ${y}">` +
+    `<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#555"/></marker></defs>` +
+    out + "</svg>";
+}
+
+function renderTable(fields, values) {
+  if (!values.length) return "<p>No rows.</p>";
+  let h = "<table><tr>" + fields.map(f => "<th>" + esc(f) + "</th>").join("") + "</tr>";
+  for (const row of values) {
+    h += "<tr>" + row.map(v => "<td>" + esc(Array.isArray(v) ? v.join(", ") : v) + "</td>").join("") + "</tr>";
+  }
+  return h + "</table>";
+}
+
+async function run(name) {
+  const status = document.getElementById("status");
+  const q = QUERIES[name];
+  document.querySelectorAll("button.q").forEach(b => b.classList.toggle("active", b.dataset.q === name));
+  status.className = ""; status.textContent = "Running " + name + " …";
+  const url = document.getElementById("url").value.replace(/\/$/, "");
+  try {
+    const res = await fetch(url + "/db/neo4j/query/v2", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Basic " + btoa("relate:" + tokenPassword())
+      },
+      body: JSON.stringify({ statement: q.cypher, parameters: q.params() })
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status + " — is relate serve running, and is the token right?");
+    const body = await res.json();
+    const fields = body.data.fields, values = body.data.values;
+    status.textContent = values.length + " row(s).";
+    document.getElementById("graph").innerHTML = q.draw(values.map(r => Object.fromEntries(fields.map((f, i) => [f, r[i]]))));
+    document.getElementById("table").innerHTML = renderTable(fields, values);
+  } catch (e) {
+    status.className = "error";
+    status.textContent = "Failed: " + e.message;
+    document.getElementById("graph").innerHTML = "";
+    document.getElementById("table").innerHTML = "";
+  }
+}
+
+document.querySelectorAll("button.q").forEach(b =>
+  b.addEventListener("click", () => run(b.dataset.q)));
+</script>
+</body>
+</html>
